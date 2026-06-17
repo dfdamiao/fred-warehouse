@@ -1,0 +1,26 @@
+# --- User secrets / config (never commit) ---
+config.json
+.env
+
+# --- Databases & data the user generates ---
+*.db
+*.duckdb
+*.parquet
+data/
+logs/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+venv/
+.venv/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/

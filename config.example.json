@@ -1,0 +1,11 @@
+{
+  "fred_api": {
+    "api_key_primary": "YOUR_FRED_API_KEY",
+    "api_key_secondary": "",
+    "api_key_tertiary": "",
+    "base_url": "https://api.stlouisfed.org/fred"
+  },
+  "database": {
+    "duckdb_path": "./fred_data.db"
+  }
+}
