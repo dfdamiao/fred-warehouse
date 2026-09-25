@@ -36,8 +36,7 @@ from fred.config import FREDConfig
 _cfg = FREDConfig()
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -48,11 +47,11 @@ TRANSFORMATION_CODES = {"lin", "chg", "ch1", "pch", "pc1", "pca", "cch", "cca", 
 # Series younger than this are skipped — they can't have new data yet.
 # Includes a small buffer beyond the release cadence.
 FREQ_MAX_AGE: Dict[str, int] = {
-    "daily": 2,       # update if >2 days old
-    "weekly": 8,      # update if >8 days old
-    "monthly": 35,    # update if >35 days old
+    "daily": 2,  # update if >2 days old
+    "weekly": 8,  # update if >8 days old
+    "monthly": 35,  # update if >35 days old
     "quarterly": 100,  # update if >100 days old
-    "annual": 370,    # update if >370 days old
+    "annual": 370,  # update if >370 days old
 }
 
 
@@ -74,11 +73,15 @@ class SmartFREDUpdater:
         self.fred = FREDDataAccess()
         self.client = FREDClient(
             _cfg.api_key_primary,
-            extra_keys=[k for k in [_cfg.api_key_secondary, _cfg.api_key_tertiary] if k],
+            extra_keys=[
+                k for k in [_cfg.api_key_secondary, _cfg.api_key_tertiary] if k
+            ],
         )
 
         # Resume capability
-        self.resume_file = resume_file or str(Path(__file__).parent / "logs" / "update_progress.json")
+        self.resume_file = resume_file or str(
+            Path(__file__).parent / "logs" / "update_progress.json"
+        )
         self.completed_series = set()
 
         self.stats = {
@@ -99,11 +102,13 @@ class SmartFREDUpdater:
         resume_path = Path(self.resume_file)
         if resume_path.exists():
             try:
-                with open(resume_path, 'r') as f:
+                with open(resume_path, "r") as f:
                     progress = json.load(f)
                     self.completed_series = set(progress.get("completed_series", []))
                     if self.completed_series:
-                        logger.info(f"Resuming: {len(self.completed_series)} series already completed")
+                        logger.info(
+                            f"Resuming: {len(self.completed_series)} series already completed"
+                        )
             except Exception as e:
                 logger.warning(f"Could not load progress file: {e}")
                 self.completed_series = set()
@@ -122,12 +127,16 @@ class SmartFREDUpdater:
         resume_path.parent.mkdir(parents=True, exist_ok=True)
 
         try:
-            with open(resume_path, 'w') as f:
-                json.dump({
-                    "completed_series": list(self.completed_series),
-                    "last_updated": datetime.now().isoformat(),
-                    "stats": self.stats
-                }, f, indent=2)
+            with open(resume_path, "w") as f:
+                json.dump(
+                    {
+                        "completed_series": list(self.completed_series),
+                        "last_updated": datetime.now().isoformat(),
+                        "stats": self.stats,
+                    },
+                    f,
+                    indent=2,
+                )
         except Exception as e:
             logger.warning(f"Could not save progress: {e}")
 
@@ -176,10 +185,7 @@ class SmartFREDUpdater:
             return None
 
     def check_data_continuity(
-        self,
-        series_id: str,
-        data: pd.DataFrame,
-        frequency: str
+        self, series_id: str, data: pd.DataFrame, frequency: str
     ) -> Tuple[bool, List[str]]:
         """
         Check for gaps in time series data.
@@ -228,6 +234,28 @@ class SmartFREDUpdater:
 
         return len(gaps) > 0, gaps
 
+    def _mark_checked(self, series_id: str, metadata: Optional[Dict]) -> None:
+        """Record that we checked the API and the series is current, so the
+        frequency-aware skip can short-circuit it next run. ``last_updated``
+        means 'when we last confirmed the series current' — it must advance on
+        up-to-date checks too, not only when data actually changes, else
+        unchanged series are re-fetched every run."""
+        if metadata:
+            metadata["last_updated"] = datetime.now()
+            self.fred.storage.store_metadata(series_id, metadata)
+
+    def _seed_metadata(self, base_id: str) -> Optional[Dict]:
+        """Fetch metadata for a base series when the suffixed key has none.
+
+        Used when seeding a key that has no metadata row at all — without a
+        ``frequency`` the freq-aware skip would treat it as daily forever.
+        """
+        try:
+            return dict(self.client.get_series_info(base_id))
+        except Exception as e:
+            logger.warning(f"Could not fetch metadata for {base_id}: {e}")
+            return None
+
     def update_single_series(
         self,
         series_id: str,
@@ -252,8 +280,9 @@ class SmartFREDUpdater:
             "status": "unknown",
             "days_old": None,
             "new_points": 0,
+            "revised_points": 0,
             "gaps_found": [],
-            "error": None
+            "error": None,
         }
 
         try:
@@ -265,8 +294,28 @@ class SmartFREDUpdater:
             metadata = self.fred.storage.get_metadata(series_id)
 
             if existing_data.empty:
-                result["status"] = "no_data"
-                result["error"] = "Series has no existing data"
+                # Orphan: a series_metadata row with zero series_data rows.
+                # These are in the work list, and the recommended-series
+                # adder skips them as "already present" — returning here left
+                # them permanently unfetchable. Seed full history instead; a
+                # genuinely empty upstream still reports no_data.
+                if check_only:
+                    result["status"] = "needs_update"
+                    return result
+                seed = self.client.get_series_data(base_id, units=units)
+                if seed.empty:
+                    result["status"] = "no_data"
+                    result["error"] = "Series has no existing data"
+                    return result
+                self.fred.storage.store_data(series_id, seed, replace_all=True)
+                self._mark_checked(series_id, metadata or self._seed_metadata(base_id))
+                result["status"] = "seeded"
+                result["new_points"] = len(seed)
+                logger.info(
+                    f"✓ {series_id}: seeded {len(seed)} points "
+                    f"({seed.index.min().strftime('%Y-%m-%d')} → "
+                    f"{seed.index.max().strftime('%Y-%m-%d')})"
+                )
                 return result
 
             # Calculate age of last data point
@@ -319,6 +368,7 @@ class SmartFREDUpdater:
 
             # Check if already up to date (last data point is today)
             if days_old < 1:
+                self._mark_checked(series_id, metadata)
                 result["status"] = "up_to_date"
                 return result
 
@@ -326,69 +376,92 @@ class SmartFREDUpdater:
                 result["status"] = "needs_update"
                 return result
 
-            # Fetch new data (strictly after last date)
-            start_date = (last_date + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            # Re-pull a trailing WINDOW, not just points strictly after the last
+            # stored date, so FRED revisions to recent observations (which keep
+            # their original date) are re-fetched. store_data(replace_all=False)
+            # is INSERT OR REPLACE, so overlapping dates upsert the revised value.
+            revision_lookback = 6  # observations
+            if len(existing_data) > revision_lookback:
+                refetch_from = existing_data.index[-revision_lookback]
+            else:
+                refetch_from = existing_data.index[0]
+            start_date = refetch_from.strftime("%Y-%m-%d")
 
             # Use base_id for API call (FRED API doesn't recognize suffixed IDs)
-            new_data = self.client.get_series_data(base_id, start_date=start_date, units=units)
+            new_data = self.client.get_series_data(
+                base_id, start_date=start_date, units=units
+            )
 
             if new_data.empty:
                 result["status"] = "up_to_date"
                 return result
 
-            # Guard against FRED API returning already-stored points (off-by-one quirk
-            # on monthly/quarterly series where observation_start is inclusive of the
-            # period containing the date, not the date itself).
-            new_data = new_data[new_data.index > last_date]
-            if new_data.empty:
+            # Split into genuinely-new points (after last stored date) and revised
+            # existing points (date already stored, value differs / newly present).
+            fresh = new_data[new_data.index > last_date]
+            overlap = new_data[new_data.index <= last_date]
+            prev = existing_data["value"].reindex(overlap.index)
+            revised = overlap[
+                overlap["value"].notna()
+                & ((overlap["value"].round(10) != prev.round(10)) | prev.isna())
+            ]
+
+            if fresh.empty and revised.empty:
+                self._mark_checked(series_id, metadata)
                 result["status"] = "up_to_date"
                 return result
+
+            to_store = pd.concat([revised, fresh])
+            to_store = to_store[~to_store.index.duplicated(keep="last")].sort_index()
 
             # Compute new latest date before storing (avoids mixed-type index issues)
-            new_last_date = max(last_date, new_data.index.max())
+            new_last_date = max(last_date, to_store.index.max())
 
-            # Validate continuity ONLY between last existing point and new data
-            # This detects disruptions in the update, not historical data issues
+            # Validate continuity between last existing point and genuinely-new
+            # data (revisions to already-stored dates don't create gaps).
             frequency = metadata.get("frequency", "Unknown") if metadata else "Unknown"
-
-            # Check gap between last existing and first new data point
-            first_new_date = new_data.index.min()
-            gap_days = (first_new_date - last_date).days
-
-            # Determine if gap is unexpected based on frequency
-            if "Daily" in frequency:
-                max_expected_gap = 7  # Weekends OK
-            elif "Weekly" in frequency:
-                max_expected_gap = 10
-            elif "Monthly" in frequency:
-                max_expected_gap = 45
-            elif "Quarterly" in frequency:
-                max_expected_gap = 100
-            elif "Annual" in frequency:
-                max_expected_gap = 400
-            else:
-                max_expected_gap = 30
-
             gaps = []
-            if gap_days > max_expected_gap:
-                gaps.append(
-                    f"{last_date.strftime('%Y-%m-%d')} → {first_new_date.strftime('%Y-%m-%d')} "
-                    f"({gap_days} days, expected ≤{max_expected_gap})"
-                )
+            if not fresh.empty:
+                first_new_date = fresh.index.min()
+                gap_days = (first_new_date - last_date).days
 
-            # Also check for gaps within the new data itself
-            if len(new_data) > 1:
-                _, new_gaps = self.check_data_continuity(series_id, new_data, frequency)
-                gaps.extend(new_gaps)
+                # Determine if gap is unexpected based on frequency
+                if "Daily" in frequency:
+                    max_expected_gap = 7  # Weekends OK
+                elif "Weekly" in frequency:
+                    max_expected_gap = 10
+                elif "Monthly" in frequency:
+                    max_expected_gap = 45
+                elif "Quarterly" in frequency:
+                    max_expected_gap = 100
+                elif "Annual" in frequency:
+                    max_expected_gap = 400
+                else:
+                    max_expected_gap = 30
+
+                if gap_days > max_expected_gap:
+                    gaps.append(
+                        f"{last_date.strftime('%Y-%m-%d')} → {first_new_date.strftime('%Y-%m-%d')} "
+                        f"({gap_days} days, expected ≤{max_expected_gap})"
+                    )
+
+                # Also check for gaps within the new data itself
+                if len(fresh) > 1:
+                    _, new_gaps = self.check_data_continuity(
+                        series_id, fresh, frequency
+                    )
+                    gaps.extend(new_gaps)
 
             if gaps:
                 result["gaps_found"] = gaps
                 self.stats["gaps_detected"] += 1
                 # Only show summary for gap warnings (detailed list in final report)
-                logger.warning(f"{series_id}: Found {len(gaps)} gap(s) in recent update")
+                logger.warning(
+                    f"{series_id}: Found {len(gaps)} gap(s) in recent update"
+                )
 
-            # Store only new data (incremental update)
-            self.fred.storage.store_data(series_id, new_data, replace_all=False)
+            # Upsert new + revised points (incremental; INSERT OR REPLACE).
+            self.fred.storage.store_data(series_id, to_store, replace_all=False)
 
             # Update metadata timestamp
             if metadata:
@@ -396,10 +469,11 @@ class SmartFREDUpdater:
                 self.fred.storage.store_metadata(series_id, metadata)
 
             result["status"] = "updated"
-            result["new_points"] = len(new_data)
+            result["new_points"] = len(fresh)
+            result["revised_points"] = len(revised)
 
             logger.info(
-                f"✓ {series_id}: +{len(new_data)} points "
+                f"✓ {series_id}: +{len(fresh)} new / {len(revised)} revised "
                 f"({last_date.strftime('%Y-%m-%d')} → {new_last_date.strftime('%Y-%m-%d')})"
             )
 
@@ -477,8 +551,11 @@ class SmartFREDUpdater:
             # Submit all tasks
             future_to_series = {
                 executor.submit(
-                    self.update_single_series, series_id,
-                    max_age_days, check_only, freq_aware,
+                    self.update_single_series,
+                    series_id,
+                    max_age_days,
+                    check_only,
+                    freq_aware,
                 ): series_id
                 for series_id in series_to_process
             }
@@ -496,23 +573,23 @@ class SmartFREDUpdater:
 
                     # Track stats
                     if result["status"] in (
-                        "up_to_date", "skipped_age", "skipped_fresh",
+                        "up_to_date",
+                        "skipped_age",
+                        "skipped_fresh",
                     ):
                         self.stats["up_to_date"] += 1
-                    elif result["status"] == "updated":
+                    elif result["status"] in ("updated", "seeded"):
                         self.stats["updated"] += 1
                     elif result["status"] == "failed":
                         self.stats["failed"] += 1
-                        self.stats["failed_series"].append({
-                            "series_id": series_id,
-                            "error": result["error"]
-                        })
+                        self.stats["failed_series"].append(
+                            {"series_id": series_id, "error": result["error"]}
+                        )
 
                     if result["gaps_found"]:
-                        self.stats["disruptions"].append({
-                            "series_id": series_id,
-                            "gaps": result["gaps_found"]
-                        })
+                        self.stats["disruptions"].append(
+                            {"series_id": series_id, "gaps": result["gaps_found"]}
+                        )
 
                     # Progress updates every 500 series
                     if processed_count % 500 == 0:
@@ -562,7 +639,7 @@ class SmartFREDUpdater:
         logger.info("\n" + "=" * 100)
         logger.info("UPDATE COMPLETE" if not check_only else "CHECK COMPLETE")
         logger.info("=" * 100)
-        logger.info(f"Time elapsed: {elapsed:.0f}s ({elapsed/60:.1f} minutes)")
+        logger.info(f"Time elapsed: {elapsed:.0f}s ({elapsed / 60:.1f} minutes)")
         logger.info(f"Total series processed: {self.stats['total']:,}")
         logger.info(f"Already up-to-date: {self.stats['up_to_date']:,}")
         logger.info(f"Successfully updated: {self.stats['updated']:,}")
@@ -596,7 +673,9 @@ class SmartFREDUpdater:
                     logger.info(f"    ... and {total_gaps - 3} more gaps")
 
             if len(self.stats["disruptions"]) > 10:
-                logger.info(f"  ... and {len(self.stats['disruptions']) - 10} more series with gaps")
+                logger.info(
+                    f"  ... and {len(self.stats['disruptions']) - 10} more series with gaps"
+                )
 
         # Database stats
         logger.info("\n" + "-" * 100)
@@ -617,42 +696,32 @@ def main():
         description="Smart FRED series updater with gap detection and auto-resume"
     )
     parser.add_argument(
-        "series_ids",
-        nargs="*",
-        help="Specific series to update (default: all)"
+        "series_ids", nargs="*", help="Specific series to update (default: all)"
     )
     parser.add_argument(
-        "--max-age",
-        type=int,
-        default=None,
-        help="Only update series older than N days"
+        "--max-age", type=int, default=None, help="Only update series older than N days"
     )
     parser.add_argument(
         "--check-only",
         action="store_true",
-        help="Dry run - only check what needs updating"
+        help="Dry run - only check what needs updating",
     )
     parser.add_argument(
         "--filter",
         type=str,
         default=None,
-        help="Only update series matching pattern (e.g., '_lin' for originals)"
+        help="Only update series matching pattern (e.g., '_lin' for originals)",
     )
     parser.add_argument(
-        "--no-resume",
-        action="store_true",
-        help="Start fresh, ignore previous progress"
+        "--no-resume", action="store_true", help="Start fresh, ignore previous progress"
     )
     parser.add_argument(
         "--no-freq-filter",
         action="store_true",
-        help="Disable frequency-aware filtering (update ALL series regardless)"
+        help="Disable frequency-aware filtering (update ALL series regardless)",
     )
     parser.add_argument(
-        "--workers",
-        type=int,
-        default=3,
-        help="Number of parallel workers (default: 3)"
+        "--workers", type=int, default=3, help="Number of parallel workers (default: 3)"
     )
 
     args = parser.parse_args()
